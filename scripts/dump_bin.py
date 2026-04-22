@@ -71,7 +71,7 @@ class DumpDataBase:
         qlib_dir: str,
         backup_dir: str = None,
         freq: str = "day",
-        max_workers: int = 4,
+        max_workers: int = 2,
         date_field_name: str = "date",
         file_suffix: str = ".csv",
         symbol_field_name: str = "symbol",
