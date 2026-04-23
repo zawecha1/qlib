@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, List, Union
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import time
 
 import fire
 import numpy as np
@@ -71,7 +72,7 @@ class DumpDataBase:
         qlib_dir: str,
         backup_dir: str = None,
         freq: str = "day",
-        max_workers: int = 2,
+        max_workers: int = 1,
         date_field_name: str = "date",
         file_suffix: str = ".csv",
         symbol_field_name: str = "symbol",
@@ -264,6 +265,8 @@ class DumpDataBase:
                 # update
                 with bin_path.open("ab") as fp:
                     np.array(_df[field]).astype("<f").tofile(fp)
+                    import time
+                    time.sleep(0.001)
             else:
                 # append; self._mode == self.ALL_MODE or not bin_path.exists()
                 np.hstack([date_index, _df[field]]).astype("<f").tofile(str(bin_path.resolve()))
@@ -396,7 +399,7 @@ class DumpDataUpdate(DumpDataBase):
         qlib_dir: str,
         backup_dir: str = None,
         freq: str = "day",
-        max_workers: int = 16,
+        max_workers: int = 1,
         date_field_name: str = "date",
         file_suffix: str = ".csv",
         symbol_field_name: str = "symbol",
