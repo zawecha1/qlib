@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, List, Union
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import time
 
 import fire
 import numpy as np
@@ -71,7 +72,7 @@ class DumpDataBase:
         qlib_dir: str,
         backup_dir: str = None,
         freq: str = "day",
-        max_workers: int = 16,
+        max_workers: int = 1,
         date_field_name: str = "date",
         file_suffix: str = ".csv",
         symbol_field_name: str = "symbol",
@@ -207,7 +208,7 @@ class DumpDataBase:
 
     def save_calendars(self, calendars_data: list):
         self._calendars_dir.mkdir(parents=True, exist_ok=True)
-        calendars_path = str(self._calendars_dir.joinpath(f"{self.freq}.txt").expanduser().resolve())
+        calendars_path = str(self._calendars_dir.joinpath(f"1{self.freq}.txt" if self.freq == "week" else f"{self.freq}.txt").expanduser().resolve())
         result_calendars_list = [self._format_datetime(x) for x in calendars_data]
         np.savetxt(calendars_path, result_calendars_list, fmt="%s", encoding="utf-8")
 
@@ -264,9 +265,13 @@ class DumpDataBase:
                 # update
                 with bin_path.open("ab") as fp:
                     np.array(_df[field]).astype("<f").tofile(fp)
+                    import time
+                    time.sleep(0.002)
             else:
                 # append; self._mode == self.ALL_MODE or not bin_path.exists()
                 np.hstack([date_index, _df[field]]).astype("<f").tofile(str(bin_path.resolve()))
+                import time
+                time.sleep(0.002)
 
     def _dump_bin(self, file_or_data: [Path, pd.DataFrame], calendar_list: List[pd.Timestamp]):
         if not calendar_list:
@@ -378,7 +383,7 @@ class DumpDataFix(DumpDataAll):
         logger.info("end of instruments dump.\n")
 
     def dump(self):
-        self._calendars_list = self._read_calendars(self._calendars_dir.joinpath(f"{self.freq}.txt"))
+        self._calendars_list = self._read_calendars(self._calendars_dir.joinpath(f"1{self.freq}.txt" if self.freq == "week" else f"{self.freq}.txt"))
         # noinspection PyAttributeOutsideInit
         self._old_instruments = (
             self._read_instruments(self._instruments_dir.joinpath(self.INSTRUMENTS_FILE_NAME))
@@ -396,7 +401,7 @@ class DumpDataUpdate(DumpDataBase):
         qlib_dir: str,
         backup_dir: str = None,
         freq: str = "day",
-        max_workers: int = 16,
+        max_workers: int = 1,
         date_field_name: str = "date",
         file_suffix: str = ".csv",
         symbol_field_name: str = "symbol",
@@ -444,7 +449,7 @@ class DumpDataUpdate(DumpDataBase):
             include_fields,
         )
         self._mode = self.UPDATE_MODE
-        self._old_calendar_list = self._read_calendars(self._calendars_dir.joinpath(f"{self.freq}.txt"))
+        self._old_calendar_list = self._read_calendars(self._calendars_dir.joinpath(f"1{self.freq}.txt" if self.freq == "week" else f"{self.freq}.txt"))
         # NOTE: all.txt only exists once for each stock
         # NOTE: if a stock corresponds to multiple different time ranges, user need to modify self._update_instruments
         self._update_instruments = (
