@@ -7,8 +7,7 @@ import traceback
 from pathlib import Path
 from typing import Iterable, List, Union
 from functools import partial
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
-import time
+from concurrent.futures import ProcessPoolExecutor
 
 import fire
 import numpy as np
@@ -447,6 +446,7 @@ class DumpDataUpdate(DumpDataBase):
             symbol_field_name,
             exclude_fields,
             include_fields,
+            limit_nums,
         )
         self._mode = self.UPDATE_MODE
         self._old_calendar_list = self._read_calendars(self._calendars_dir.joinpath(f"1{self.freq}.txt" if self.freq == "week" else f"{self.freq}.txt"))
@@ -457,37 +457,79 @@ class DumpDataUpdate(DumpDataBase):
             .set_index([self.symbol_field_name])
             .to_dict(orient="index")
         )  # type: dict
+        self._new_calendar_list = []
+        self._symbol_files = {}
 
-        # load all csv files
-        self._all_data = self._load_all_source_data()  # type: pd.DataFrame
-        self._new_calendar_list = self._old_calendar_list + sorted(
-            filter(lambda x: x > self._old_calendar_list[-1], self._all_data[self.date_field_name].unique())
-        )
+    def _normalize_symbol(self, symbol) -> str:
+        return fname_to_code(str(symbol).lower()).upper()
 
-    def _load_all_source_data(self):
-        # NOTE: Need more memory
-        logger.info("start load all source data....")
-        all_df = []
+    def _read_update_source_data(self, file_path: Path) -> pd.DataFrame:
+        _df = read_as_df(file_path, low_memory=False)
+        if self.date_field_name in _df.columns and not np.issubdtype(_df[self.date_field_name].dtype, np.datetime64):
+            _df[self.date_field_name] = pd.to_datetime(_df[self.date_field_name])
+        if self.symbol_field_name not in _df.columns:
+            _df[self.symbol_field_name] = self.get_symbol_from_file(file_path)
+        return _df
 
-        def _read_df(file_path: Path):
-            _df = read_as_df(file_path)
-            if self.date_field_name in _df.columns and not np.issubdtype(
-                _df[self.date_field_name].dtype, np.datetime64
-            ):
-                _df[self.date_field_name] = pd.to_datetime(_df[self.date_field_name])
-            if self.symbol_field_name not in _df.columns:
-                _df[self.symbol_field_name] = self.get_symbol_from_file(file_path)
-            return _df
-
+    def _scan_source_data(self):
+        logger.info("start scan source data......")
+        all_datetime = set()
+        self._symbol_files = {}
         with tqdm(total=len(self.df_files)) as p_bar:
-            with ThreadPoolExecutor(max_workers=self.works) as executor:
-                for df in executor.map(_read_df, self.df_files):
-                    if not df.empty:
-                        all_df.append(df)
-                    p_bar.update()
+            for file_path in self.df_files:
+                _df = self._read_update_source_data(file_path)
+                if not _df.empty:
+                    if self.date_field_name in _df.columns:
+                        all_datetime.update(map(pd.Timestamp, _df[self.date_field_name].dropna().unique()))
+                    else:
+                        logger.warning(f"{file_path} does not contain date field: {self.date_field_name}")
+                    for _symbol in _df[self.symbol_field_name].dropna().unique():
+                        _code = self._normalize_symbol(_symbol)
+                        _file_paths = self._symbol_files.setdefault(_code, [])
+                        if file_path not in _file_paths:
+                            _file_paths.append(file_path)
+                p_bar.update()
 
-        logger.info("end of load all data.\n")
-        return pd.concat(all_df, sort=False)
+        if self._old_calendar_list:
+            self._new_calendar_list = self._old_calendar_list + sorted(
+                filter(lambda x: x > self._old_calendar_list[-1], all_datetime)
+            )
+        else:
+            self._new_calendar_list = sorted(all_datetime)
+        logger.info("end of scan source data.\n")
+
+    def _load_symbol_data(self, code: str, file_paths: List[Path]) -> pd.DataFrame:
+        stock_data = []
+        for file_path in file_paths:
+            _df = self._read_update_source_data(file_path)
+            if _df.empty:
+                continue
+            _symbol_code = _df[self.symbol_field_name].apply(self._normalize_symbol)
+            _df = _df.loc[_symbol_code == code]
+            if not _df.empty:
+                stock_data.append(_df)
+        if not stock_data:
+            return pd.DataFrame()
+        return pd.concat(stock_data, sort=False)
+
+    def _dump_symbol_data(self, code: str, df: pd.DataFrame):
+        _start, _end = self._get_date(df, is_begin_end=True)
+        if not (isinstance(_start, pd.Timestamp) and isinstance(_end, pd.Timestamp)):
+            return
+        if code in self._update_instruments:
+            # exists stock, will append data
+            old_end = pd.Timestamp(self._update_instruments[code][self.INSTRUMENTS_END_FIELD])
+            _update_df = df[df[self.date_field_name] > old_end]
+            _update_calendars = _update_df[self.date_field_name].dropna().drop_duplicates().sort_values().to_list()
+            if _update_calendars:
+                self._update_instruments[code][self.INSTRUMENTS_END_FIELD] = self._format_datetime(_end)
+                self._dump_bin(_update_df, _update_calendars)
+        else:
+            # new stock
+            _dt_range = self._update_instruments.setdefault(code, dict())
+            _dt_range[self.INSTRUMENTS_START_FIELD] = self._format_datetime(_start)
+            _dt_range[self.INSTRUMENTS_END_FIELD] = self._format_datetime(_end)
+            self._dump_bin(df, self._new_calendar_list)
 
     def _dump_calendars(self):
         pass
@@ -498,44 +540,21 @@ class DumpDataUpdate(DumpDataBase):
     def _dump_features(self):
         logger.info("start dump features......")
         error_code = {}
-        with ProcessPoolExecutor(max_workers=self.works) as executor:
-            futures = {}
-            for _code, _df in self._all_data.groupby(self.symbol_field_name, group_keys=False):
-                _code = fname_to_code(str(_code).lower()).upper()
-                _start, _end = self._get_date(_df, is_begin_end=True)
-                if not (isinstance(_start, pd.Timestamp) and isinstance(_end, pd.Timestamp)):
-                    continue
-                if _code in self._update_instruments:
-                    # exists stock, will append data
-                    _update_calendars = (
-                        _df[_df[self.date_field_name] > self._update_instruments[_code][self.INSTRUMENTS_END_FIELD]][
-                            self.date_field_name
-                        ]
-                        .sort_values()
-                        .to_list()
-                    )
-                    if _update_calendars:
-                        self._update_instruments[_code][self.INSTRUMENTS_END_FIELD] = self._format_datetime(_end)
-                        futures[executor.submit(self._dump_bin, _df, _update_calendars)] = _code
-                else:
-                    # new stock
-                    _dt_range = self._update_instruments.setdefault(_code, dict())
-                    _dt_range[self.INSTRUMENTS_START_FIELD] = self._format_datetime(_start)
-                    _dt_range[self.INSTRUMENTS_END_FIELD] = self._format_datetime(_end)
-                    futures[executor.submit(self._dump_bin, _df, self._new_calendar_list)] = _code
-
-            with tqdm(total=len(futures)) as p_bar:
-                for _future in as_completed(futures):
-                    try:
-                        _future.result()
-                    except Exception:
-                        error_code[futures[_future]] = traceback.format_exc()
-                    p_bar.update()
-            logger.info(f"dump bin errors: {error_code}")
+        with tqdm(total=len(self._symbol_files)) as p_bar:
+            for _code, _file_paths in self._symbol_files.items():
+                try:
+                    _df = self._load_symbol_data(_code, _file_paths)
+                    if not _df.empty:
+                        self._dump_symbol_data(_code, _df)
+                except Exception:
+                    error_code[_code] = traceback.format_exc()
+                p_bar.update()
+        logger.info(f"dump bin errors: {error_code}")
 
         logger.info("end of features dump.\n")
 
     def dump(self):
+        self._scan_source_data()
         self.save_calendars(self._new_calendar_list)
         self._dump_features()
         df = pd.DataFrame.from_dict(self._update_instruments, orient="index")
